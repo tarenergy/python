@@ -1,0 +1,632 @@
+import tkinter as tk
+from tkinter import ttk
+import pygame
+import random
+import math
+import os
+from pygame.math import Vector2 # Pygame's Vector2 ist sehr praktisch
+import time # Für wanderndes Verhalten
+
+# --- Pygame Fenster Setup ---
+SCREEN_WIDTH = 0
+SCREEN_HEIGHT = 0
+FPS = 60
+
+# --- Farben ---
+WHITE = (255, 255, 255)
+RED = (255, 50, 50)
+BLUE = (50, 50, 255)
+BLACK = (0, 0, 0)
+GRAY = (100, 100, 100) # Farbe für den Hai
+DARK_GRAY = (50, 50, 50) # Dunkleres Grau
+
+# --- Boid Klasse (unverändert zur letzten Version) ---
+class Boid:
+    def __init__(self, x, y, color, params):
+        self.position = Vector2(x, y)
+        max_speed_init = params.get('max_speed', tk.DoubleVar(value=4.0)).get()
+        angle = random.uniform(0, 2 * math.pi)
+        initial_speed = random.uniform(1, max(1.1, max_speed_init / 2))
+        self.velocity = Vector2(math.cos(angle), math.sin(angle)) * initial_speed
+        self.acceleration = Vector2(0, 0)
+        self.color = color
+        self.params = params
+        self.size = 6
+
+    def apply_force(self, force):
+        if force and math.isfinite(force.x) and math.isfinite(force.y):
+            self.acceleration += force
+
+    def seek(self, target):
+        max_speed = self.params['max_speed'].get()
+        max_force = self.params['max_force'].get()
+        desired = (target - self.position)
+        dist = desired.length()
+        if dist > 0:
+            desired = desired.normalize() * max_speed
+            steer = (desired - self.velocity)
+            if steer.length() > max_force:
+                steer.scale_to_length(max_force)
+            return steer
+        return Vector2(0, 0)
+
+    def separate(self, boids):
+        steering = Vector2(0, 0)
+        total = 0
+        sep_dist = self.params['separation_distance'].get()
+        max_speed = self.params['max_speed'].get()
+        max_force = self.params['max_force'].get()
+        for other in boids:
+            try:
+                dist_sq = self.position.distance_squared_to(other.position)
+            except OverflowError: dist_sq = float('inf')
+            if self != other and 0 < dist_sq < sep_dist * sep_dist and other.color == self.color:
+                distance = math.sqrt(dist_sq)
+                diff = self.position - other.position
+                diff /= (distance * distance) if distance > 1 else 1
+                steering += diff
+                total += 1
+        if total > 0:
+            steering /= total
+            if steering.length() > 0:
+                steering = steering.normalize() * max_speed
+            steer = steering - self.velocity
+            if steer.length() > max_force:
+                steer.scale_to_length(max_force)
+            return steer
+        return Vector2(0, 0)
+
+    def align(self, boids):
+        steering = Vector2(0, 0)
+        total = 0
+        vis_range = self.params['visual_range'].get()
+        max_speed = self.params['max_speed'].get()
+        max_force = self.params['max_force'].get()
+        for other in boids:
+            try:
+                dist_sq = self.position.distance_squared_to(other.position)
+            except OverflowError: dist_sq = float('inf')
+            if self != other and 0 < dist_sq < vis_range * vis_range and other.color == self.color:
+                 if other.velocity and other.velocity.length_squared() > 0:
+                    steering += other.velocity
+                    total += 1
+        if total > 0:
+            steering /= total
+            if steering.length() > 0:
+                steering = steering.normalize() * max_speed
+            steer = steering - self.velocity
+            if steer.length() > max_force:
+                steer.scale_to_length(max_force)
+            return steer
+        return Vector2(0, 0)
+
+    def cohere(self, boids):
+        center_of_mass = Vector2(0, 0)
+        total = 0
+        vis_range = self.params['visual_range'].get()
+        for other in boids:
+            try:
+                dist_sq = self.position.distance_squared_to(other.position)
+            except OverflowError: dist_sq = float('inf')
+            if self != other and 0 < dist_sq < vis_range * vis_range and other.color == self.color:
+                center_of_mass += other.position
+                total += 1
+        if total > 0:
+            center_of_mass /= total
+            return self.seek(center_of_mass)
+        return Vector2(0, 0)
+
+    def avoid(self, boids):
+        steering = Vector2(0, 0)
+        total = 0
+        avoid_range = self.params['avoidance_range'].get()
+        max_speed = self.params['max_speed'].get()
+        max_force = self.params['max_force'].get()
+        for other in boids:
+            try:
+                dist_sq = self.position.distance_squared_to(other.position)
+            except OverflowError: dist_sq = float('inf')
+            if self != other and 0 < dist_sq < avoid_range * avoid_range and other.color != self.color:
+                distance = math.sqrt(dist_sq)
+                diff = self.position - other.position
+                diff /= (distance * distance) if distance > 1 else 1
+                steering += diff
+                total += 1
+        if total > 0:
+            steering /= total
+            if steering.length() > 0:
+                steering = steering.normalize() * max_speed
+            steer = steering - self.velocity
+            if steer.length() > max_force:
+                steer.scale_to_length(max_force)
+            return steer
+        return Vector2(0, 0)
+
+    def flock(self, all_boids):
+        sep = self.separate(all_boids) * self.params['separation_factor'].get()
+        ali = self.align(all_boids) * self.params['alignment_factor'].get()
+        coh = self.cohere(all_boids) * self.params['cohesion_factor'].get()
+        avo = self.avoid(all_boids) * self.params['avoidance_factor'].get()
+        self.apply_force(sep)
+        self.apply_force(ali)
+        self.apply_force(coh)
+        self.apply_force(avo)
+
+    def update(self):
+        max_speed = self.params['max_speed'].get()
+        self.velocity += self.acceleration
+        vel_len_sq = self.velocity.length_squared()
+        if vel_len_sq < 0.001:
+            angle = random.uniform(0, 2 * math.pi)
+            self.velocity = Vector2(math.cos(angle), math.sin(angle)) * 0.1
+        elif vel_len_sq > max_speed * max_speed:
+            self.velocity.scale_to_length(max_speed)
+        self.position += self.velocity
+        self.acceleration *= 0
+
+    def wrap_borders(self, width, height):
+        buffer = self.size * 2
+        if self.position.x < -buffer: self.position.x = width + buffer
+        if self.position.y < -buffer: self.position.y = height + buffer
+        if self.position.x > width + buffer: self.position.x = -buffer
+        if self.position.y > height + buffer: self.position.y = -buffer
+
+    def draw(self, screen):
+        if self.velocity.length_squared() < 0.01:
+            try:
+                draw_pos = (int(self.position.x), int(self.position.y))
+                pygame.draw.circle(screen, self.color, draw_pos, int(self.size * 0.8))
+            except OverflowError: pass
+            return
+        try:
+            heading = self.velocity.normalize()
+        except ValueError: heading = Vector2(1, 0)
+        tip_length_factor = 2.0
+        base_offset_factor = 0.6
+        width_factor = 0.4
+        tip = self.position + heading * self.size * tip_length_factor
+        base_point = self.position - heading * self.size * base_offset_factor
+        perp_vec = Vector2(-heading.y, heading.x) * self.size * width_factor
+        base_left = base_point + perp_vec
+        base_right = base_point - perp_vec
+        try:
+            points = [
+                (int(tip.x), int(tip.y)),
+                (int(base_left.x), int(base_left.y)),
+                (int(base_right.x), int(base_right.y))
+            ]
+            pygame.draw.polygon(screen, self.color, points)
+        except OverflowError: pass
+
+# --- NEUE Shark Klasse ---
+class Shark:
+    def __init__(self, x, y):
+        self.position = Vector2(x, y)
+        self.velocity = Vector2(random.uniform(-1, 1), random.uniform(-1, 1)).normalize() * 2
+        self.acceleration = Vector2(0, 0)
+        self.color = DARK_GRAY # Hai-Farbe
+        self.outline_color = GRAY
+        self.size = 12  # Größer als Boids
+        self.max_speed = 3.5 # Etwas langsamer als schnelle Boids, aber konstant
+        self.max_force = 0.3 # Stärkere Lenkkraft als Boids
+        self.perception_radius = 150 # Wie weit der Hai Boids "sieht"
+        self.eat_radius = self.size * 1.1 # Distanz, bei der gefressen wird
+        self.wander_angle = random.uniform(0, 2 * math.pi) # Für wanderndes Verhalten
+
+    def apply_force(self, force):
+         if force and math.isfinite(force.x) and math.isfinite(force.y):
+            self.acceleration += force
+
+    def seek(self, target_pos):
+        desired = (target_pos - self.position)
+        dist = desired.length()
+        if dist > 0:
+            desired = desired.normalize() * self.max_speed
+            steer = (desired - self.velocity)
+            if steer.length() > self.max_force:
+                steer.scale_to_length(self.max_force)
+            return steer
+        return Vector2(0, 0)
+
+    def hunt(self, all_boids):
+        """Findet den nächsten Boid und steuert darauf zu."""
+        closest_boid = None
+        min_dist_sq = self.perception_radius * self.perception_radius # Quadrat verwenden!
+
+        for boid in all_boids:
+            try:
+                dist_sq = self.position.distance_squared_to(boid.position)
+                if dist_sq < min_dist_sq:
+                    min_dist_sq = dist_sq
+                    closest_boid = boid
+            except OverflowError:
+                continue # Boid ist zu weit weg
+
+        if closest_boid:
+            # Ziel gefunden, darauf zusteuern
+            seek_force = self.seek(closest_boid.position)
+            self.apply_force(seek_force)
+            return True # Signalisiert, dass ein Ziel verfolgt wird
+        else:
+            # Kein Ziel in Reichweite, herumwandern
+            self.wander()
+            return False
+
+    def wander(self):
+        """Steuert zufällig herum, wenn kein Ziel vorhanden ist."""
+        # Leichte zufällige Änderung des aktuellen Winkels
+        self.wander_angle += random.uniform(-0.3, 0.3) # Stärke der Winkeländerung
+
+        # Berechne einen Punkt etwas vor dem Hai basierend auf dem Wanderwinkel
+        # Erzeuge einen Vektor basierend auf dem Wanderwinkel
+        wander_target_direction = Vector2(math.cos(self.wander_angle), math.sin(self.wander_angle))
+
+        # Ziel leicht vor dem Hai in Wanderrichtung
+        # circle_center = self.velocity.normalize() * 50 # Punkt vor dem Hai
+        # wander_target = self.position + circle_center + wander_target_direction * 20
+
+        # Einfachere Version: Direkte Kraft in Wanderrichtung anwenden
+        wander_force = wander_target_direction * self.max_force * 0.5 # Schwächere Kraft
+        self.apply_force(wander_force)
+
+
+    def update(self):
+        self.velocity += self.acceleration
+        if self.velocity.length() > self.max_speed:
+            self.velocity.scale_to_length(self.max_speed)
+        self.position += self.velocity
+        self.acceleration *= 0
+
+    def wrap_borders(self, width, height):
+        # Hai bleibt am Bildschirmrand und kehrt um (statt zu wrappen)
+        buffer = self.size * 2
+        turn_force = 0.1 # Stärke der Umkehrkraft
+
+        steer = Vector2()
+        if self.position.x < buffer:
+            desired = Vector2(self.max_speed, self.velocity.y)
+            steer = desired - self.velocity
+        elif self.position.x > width - buffer:
+             desired = Vector2(-self.max_speed, self.velocity.y)
+             steer = desired - self.velocity
+        if self.position.y < buffer:
+             desired = Vector2(self.velocity.x, self.max_speed)
+             steer = desired - self.velocity
+        elif self.position.y > height - buffer:
+             desired = Vector2(self.velocity.x, -self.max_speed)
+             steer = desired - self.velocity
+
+        if steer.length_squared() > 0:
+             if steer.length() > self.max_force * 2: # Stärkere Kraft am Rand
+                 steer.scale_to_length(self.max_force * 2)
+             self.apply_force(steer)
+
+
+    def draw(self, screen):
+         # Zeichne Hai als dunkleres, größeres Dreieck
+        if self.velocity.length_squared() < 0.01:
+             heading = Vector2(1, 0) # Fallback
+        else:
+            try:
+                heading = self.velocity.normalize()
+            except ValueError:
+                 heading = Vector2(1, 0)
+
+        # Längeres, spitzeres Dreieck für den Hai
+        tip_length_factor = 2.5
+        base_offset_factor = 0.8
+        width_factor = 0.5
+
+        tip = self.position + heading * self.size * tip_length_factor
+        base_point = self.position - heading * self.size * base_offset_factor
+        perp_vec = Vector2(-heading.y, heading.x) * self.size * width_factor
+        base_left = base_point + perp_vec
+        base_right = base_point - perp_vec
+
+        try:
+            points = [
+                (int(tip.x), int(tip.y)),
+                (int(base_left.x), int(base_left.y)),
+                (int(base_right.x), int(base_right.y))
+            ]
+            pygame.draw.polygon(screen, self.color, points)
+            pygame.draw.polygon(screen, self.outline_color, points, 1) # Umrandung
+        except OverflowError:
+             pass
+
+
+# --- Schwarm Klasse (unverändert) ---
+class Swarm:
+    def __init__(self, initial_count, color, params):
+        self.color = color
+        self.params = params
+        self.boids = []
+
+    def initialize_boids(self, initial_count):
+         self.update_boid_count(initial_count)
+
+    def update_boid_count(self, target_count):
+        target_count = int(target_count)
+        current_count = len(self.boids)
+        delta = target_count - current_count
+        global SCREEN_WIDTH, SCREEN_HEIGHT
+
+        if delta > 0:
+            for _ in range(delta):
+                start_x = random.uniform(0, SCREEN_WIDTH) if SCREEN_WIDTH > 0 else 100
+                start_y = random.uniform(0, SCREEN_HEIGHT) if SCREEN_HEIGHT > 0 else 100
+                new_boid = Boid(start_x, start_y, self.color, self.params)
+                self.boids.append(new_boid)
+        elif delta < 0:
+            self.boids = self.boids[:target_count]
+        return delta != 0
+
+    def run(self, screen, all_boids):
+        # Berechnung der Kräfte für alle Boids zuerst
+        for boid in self.boids:
+            boid.flock(all_boids)
+        # Dann Update und Zeichnen
+        for boid in self.boids:
+            boid.update()
+            boid.wrap_borders(SCREEN_WIDTH, SCREEN_HEIGHT)
+            boid.draw(screen)
+
+# --- Tkinter Setup (unverändert) ---
+def setup_tkinter_controls():
+    root = tk.Tk()
+    root.title("Boid Parameter")
+    root.geometry("400x700") # Höhe leicht erhöht für neue Slider
+    root.protocol("WM_DELETE_WINDOW", lambda: close_app(root))
+    notebook = ttk.Notebook(root)
+    notebook.pack(pady=10, padx=10, expand=True, fill="both")
+    params_swarm1 = {}
+    params_swarm2 = {}
+    frame1 = ttk.Frame(notebook, padding="10")
+    notebook.add(frame1, text='Schwarm 1 (Blau)')
+    create_sliders(frame1, params_swarm1, default_values_swarm1)
+    frame2 = ttk.Frame(notebook, padding="10")
+    notebook.add(frame2, text='Schwarm 2 (Rot)')
+    create_sliders(frame2, params_swarm2, default_values_swarm2)
+    return root, params_swarm1, params_swarm2
+
+# --- Create Sliders (unverändert) ---
+def create_sliders(parent_frame, params_dict, default_values):
+    row_index = 0
+    if 'boid_count' not in slider_definitions:
+         slider_definitions['boid_count'] = ("Anzahl Fische", 1, 250, 1) # Max Anzahl ggf. anpassen
+
+    for key in slider_definitions:
+        if key not in default_values: continue
+        label_text, min_val, max_val, resolution = slider_definitions[key]
+        if key == 'boid_count':
+            params_dict[key] = tk.IntVar(value=int(default_values[key]))
+            var_type = 'int'
+        else:
+            params_dict[key] = tk.DoubleVar(value=default_values[key])
+            var_type = 'float'
+        label = ttk.Label(parent_frame, text=f"{label_text}:")
+        label.grid(row=row_index, column=0, sticky="w", padx=5, pady=2)
+        value_label = ttk.Label(parent_frame, text="")
+        value_label.grid(row=row_index, column=2, sticky="e", padx=5)
+        def make_update_callback(k, var, lbl, vtype):
+            def callback(val):
+                try:
+                    current_val = var.get()
+                    if vtype == 'int': lbl.config(text=f"{current_val}")
+                    else: lbl.config(text=f"{current_val:.2f}")
+                except tk.TclError: pass
+            return callback
+        update_label_callback = make_update_callback(key, params_dict[key], value_label, var_type)
+        slider = ttk.Scale(parent_frame, from_=min_val, to=max_val, orient=tk.HORIZONTAL,
+                           variable=params_dict[key], length=200,
+                           command=update_label_callback)
+        update_label_callback(params_dict[key].get())
+        slider.grid(row=row_index, column=1, sticky="ew", padx=5)
+        parent_frame.grid_columnconfigure(1, weight=1)
+        row_index += 1
+
+# --- Globale Variablen und Definitionen ---
+running = True
+screen = None
+# Parameter und Defaults wurden bereits oben erweitert
+
+def close_app(root):
+    global running
+    if not running: return
+    running = False
+    print("Beende Anwendung...")
+    try:
+        root.destroy()
+        print("Tkinter beendet.")
+    except tk.TclError: print("Tkinter bereits beendet oder Fehler.")
+    except Exception as e: print(f"Anderer Fehler beim Beenden von Tkinter: {e}")
+    pygame.quit()
+    print("Pygame beendet.")
+
+# Slider Definitionen: key: (Label, Min, Max, Auflösung)
+slider_definitions = {
+    'boid_count': ("Anzahl Fische", 1, 250, 1),
+    'separation_factor': ("Separation Stärke", 0.0, 5.0, 0.1),
+    'alignment_factor': ("Alignment Stärke", 0.0, 5.0, 0.1),
+    'cohesion_factor': ("Kohäsion Stärke", 0.0, 5.0, 0.1),
+    'visual_range': ("Sichtweite (Gruppe)", 10.0, 200.0, 1.0),
+    'separation_distance': ("Min. Abstand (Gruppe)", 5.0, 100.0, 1.0),
+    'avoidance_factor': ("Abneigungs-Stärke", 0.0, 10.0, 0.1), # Gegen andere Gruppe
+    'avoidance_range': ("Abneigungs-Reichweite", 10.0, 250.0, 1.0), # Gegen andere Gruppe
+    'max_speed': ("Max. Tempo", 1.0, 10.0, 0.1),
+    'max_force': ("Max. Lenkkraft", 0.01, 1.0, 0.01),
+}
+
+# Standardwerte für die Schwärme (inkl. Abneigung)
+default_values_swarm1 = {
+    'boid_count': 80,
+    'separation_factor': 1.8, 'alignment_factor': 1.0, 'cohesion_factor': 1.0,
+    'visual_range': 70.0, 'separation_distance': 25.0,
+    'avoidance_factor': 3.0, 'avoidance_range': 80.0,
+    'max_speed': 4.0, 'max_force': 0.2,
+}
+default_values_swarm2 = {
+    'boid_count': 60,
+    'separation_factor': 1.5, 'alignment_factor': 1.2, 'cohesion_factor': 0.8,
+    'visual_range': 50.0, 'separation_distance': 30.0,
+    'avoidance_factor': 2.5, 'avoidance_range': 90.0,
+    'max_speed': 5.0, 'max_force': 0.25,
+}
+
+# --- Hauptteil ---
+if __name__ == "__main__":
+    root, params1, params2 = setup_tkinter_controls()
+    pygame.init()
+    pygame.font.init()
+
+    # Bildschirm Setup (Fullscreen mit Fallback)
+    try:
+        display_info = pygame.display.Info()
+        SCREEN_WIDTH = display_info.current_w
+        SCREEN_HEIGHT = display_info.current_h
+        print(f"Versuche Vollbildmodus: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
+        screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
+        print("Vollbildmodus erfolgreich gesetzt.")
+    except pygame.error as e:
+        print(f"Fehler beim Setzen des Vollbildmodus: {e}. Versuche Fenstermodus 1280x720...")
+        SCREEN_WIDTH, SCREEN_HEIGHT = 1280, 720
+        try:
+            screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE | pygame.DOUBLEBUF)
+            print("Fenstermodus erfolgreich gesetzt.")
+        except pygame.error as e2:
+             print(f"Fehler beim Setzen des Fenstermodus: {e2}")
+             close_app(root); exit()
+    if not screen: print("Fehler: Pygame-Fenster konnte nicht erstellt werden."); close_app(root); exit()
+
+    pygame.display.set_caption("Boids Simulation mit Hai")
+    clock = pygame.time.Clock()
+    app_font = None
+    try: app_font = pygame.font.SysFont(None, 30)
+    except Exception as e: print(f"Warnung: Konnte Systemschriftart nicht laden: {e}")
+
+    # Schwärme und Hai erstellen
+    try:
+        swarm1 = Swarm(0, BLUE, params1)
+        swarm2 = Swarm(0, RED, params2)
+        swarm1.initialize_boids(int(default_values_swarm1['boid_count']))
+        swarm2.initialize_boids(int(default_values_swarm2['boid_count']))
+        all_boids = swarm1.boids + swarm2.boids
+        # Erstelle den Hai in der Mitte
+        shark = Shark(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2)
+        print(f"Schwärme erstellt: S1={len(swarm1.boids)}, S2={len(swarm2.boids)}. Hai erstellt.")
+    except Exception as e: print(f"Fehler beim Erstellen der Schwärme/Hai: {e}"); close_app(root); exit()
+
+
+    # --- Hauptschleife (angetrieben durch Tkinter) ---
+    def simulation_update():
+        global running, all_boids, screen, app_font, shark, swarm1, swarm2
+
+        if not running or screen is None: return
+
+        # === Event Handling (Pygame) ===
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: close_app(root); return
+            if event.type == pygame.KEYDOWN:
+                 if event.key == pygame.K_ESCAPE: close_app(root); return
+            if event.type == pygame.VIDEORESIZE and not (screen.get_flags() & pygame.FULLSCREEN):
+                 global SCREEN_WIDTH, SCREEN_HEIGHT
+                 SCREEN_WIDTH, SCREEN_HEIGHT = event.w, event.h
+                 try: screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE | pygame.DOUBLEBUF)
+                 except pygame.error as e: print(f"Fehler bei Fenstergrößenänderung: {e}")
+
+        # === Boid Anzahl anpassen (durch Slider) ===
+        count_changed_by_slider = False
+        try:
+            target_count1 = params1['boid_count'].get()
+            if swarm1.update_boid_count(target_count1): count_changed_by_slider = True
+            target_count2 = params2['boid_count'].get()
+            if swarm2.update_boid_count(target_count2): count_changed_by_slider = True
+        except tk.TclError:
+             if running: close_app(root); return
+        except Exception as e:
+             print(f"Fehler beim Update der Boid-Anzahl: {e}");
+             if running: close_app(root); return
+
+        if count_changed_by_slider:
+            all_boids = swarm1.boids + swarm2.boids # Nur neu bauen, wenn Slider geändert wurde
+
+        # === Hai frisst Fische ===
+        eaten_this_frame = []
+        # Kopie der Liste für sichere Iteration, während Original ggf. geändert wird
+        boids_to_check = list(all_boids)
+        eat_radius_sq = shark.eat_radius * shark.eat_radius # Quadrat für Effizienz
+
+        for boid in boids_to_check:
+            try:
+                dist_sq = shark.position.distance_squared_to(boid.position)
+                if dist_sq < eat_radius_sq:
+                    eaten_this_frame.append(boid)
+                    # Optional: Nur einen Fisch pro Frame fressen lassen
+                    # break
+            except OverflowError:
+                continue # Boid ist zu weit weg oder ungültig
+
+        # Entferne gefressene Boids *nach* der Überprüfungsschleife
+        if eaten_this_frame:
+            print(f"Hai hat {len(eaten_this_frame)} Fisch(e) gefressen!") # Debug Info
+            for eaten_boid in eaten_this_frame:
+                # Sicherstellen, dass der Boid noch in den Listen ist, bevor er entfernt wird
+                if eaten_boid in all_boids:
+                    all_boids.remove(eaten_boid)
+                if eaten_boid.color == BLUE and eaten_boid in swarm1.boids:
+                    swarm1.boids.remove(eaten_boid)
+                elif eaten_boid.color == RED and eaten_boid in swarm2.boids:
+                    swarm2.boids.remove(eaten_boid)
+            # print(f"Verbleibende Fische: {len(all_boids)}") # Debug Info
+
+
+        # === Simulation & Rendering ===
+        try:
+            screen.fill(BLACK)
+
+            # Schwärme simulieren und zeichnen (nur wenn Fische da sind)
+            if len(all_boids) > 0:
+                 swarm1.run(screen, all_boids)
+                 swarm2.run(screen, all_boids)
+            elif app_font: # Nachricht, wenn keine Fische mehr da sind
+                 text = app_font.render("Alle Fische gefressen!", True, WHITE)
+                 text_rect = text.get_rect(center=(SCREEN_WIDTH/2, SCREEN_HEIGHT/2))
+                 screen.blit(text, text_rect)
+
+            # Hai simulieren und zeichnen
+            shark.hunt(all_boids) # Ziel suchen oder wandern
+            shark.update()
+            shark.wrap_borders(SCREEN_WIDTH, SCREEN_HEIGHT) # Am Rand umkehren
+            shark.draw(screen)
+
+            pygame.display.flip() # Pygame Anzeige aktualisieren
+            clock.tick(FPS) # Framerate begrenzen
+        except pygame.error as e: print(f"Pygame Render/Flip-Fehler: {e}")
+        except Exception as e: print(f"Unerwarteter Fehler in Rendering/Simulation: {e}")
+
+
+        # === Tkinter Update (minimal) ===
+        try:
+            if root.winfo_exists(): root.update_idletasks()
+            else:
+                 if running: print("Tkinter Fenster wurde extern geschlossen (update)."); close_app(root)
+                 return
+        except tk.TclError:
+             if running: print("Tkinter TclError in update_idletasks."); close_app(root)
+             return
+
+        # Nächsten Update-Aufruf planen (rekursiv)
+        if running:
+            root.after(max(1, 1000 // FPS), simulation_update)
+
+
+    # Starte die Simulationsschleife
+    print("Starte Simulations-Loop...")
+    root.after(100, simulation_update)
+
+    # Starte die Tkinter Hauptschleife
+    print("Starte Tkinter mainloop...")
+    root.mainloop()
+
+    # Wird erreicht, nachdem root.quit()/destroy() aufgerufen wurde
+    # (Finale Meldungen kommen von close_app)
